@@ -79,6 +79,8 @@ def detect_tool_format(model_name_or_path: str) -> str:
            Used by Llama 3.1+ which has built-in function calling via chat template.
     """
     key = normalize_model_key(model_name_or_path)
+    if "deepseek" in key:
+        return "native"
     # Llama 3.1+ uses native function calling (bare JSON + ipython/tool role)
     if "llama" in key:
         return "native"
@@ -487,6 +489,8 @@ def init_state(task, system_prompt, record_mode="lite", prompt_mode="current", r
         "tokenizer": tokenizer,
         "generation_tokens": 0,
         "prefill_tokens": 0,
+        "api_prompt_tokens": 0,
+        "api_completion_tokens": 0,
     }
 
 
@@ -507,9 +511,15 @@ def _append_and_track(state, role, content):
 def step_state(state, out, trace_item=None):
     state["rounds"] += 1
     raw_text = out.get("raw_text", out.get("content", ""))
-    state["messages"].append({"role": "assistant", "content": raw_text})
+    if out.get("api_message"):
+        state["messages"].append(out["api_message"])
+    else:
+        state["messages"].append({"role": "assistant", "content": raw_text})
     # Count generation tokens (model output)
     state["generation_tokens"] += _count_tokens(state, raw_text)
+    api_usage = out.get("api_usage", {})
+    state["api_prompt_tokens"] += int(api_usage.get("prompt_tokens", 0))
+    state["api_completion_tokens"] += int(api_usage.get("completion_tokens", 0))
     prompt_mode = state.get("prompt_mode", "current")
     tool_format = state.get("tool_format", "xml")
     require_reasoning = bool(state.get("require_reasoning", True))
@@ -536,7 +546,10 @@ def step_state(state, out, trace_item=None):
             return
 
         if not skip_reasoning_check and not state.get("_last_tool_success"):
-            has_reasoning = has_reasoning_before_tool(out.get("raw_text", ""))
+            # API tool calls already arrive as structured function-call messages.
+            # Do not reject their accompanying display text as a free-form
+            # reasoning trace; the tool-call/response pair must stay balanced.
+            has_reasoning = False if out.get("api_message") else has_reasoning_before_tool(out.get("raw_text", ""))
             if require_reasoning and (not has_reasoning):
                 _append_and_track(state, "user",
                     "Tool call rejected: missing reasoning before tool call. "
@@ -572,6 +585,8 @@ def step_state(state, out, trace_item=None):
         if tool_format == "native":
             tool_content = json.dumps(tool_res, ensure_ascii=False)
             _append_and_track(state, "tool", tool_content)
+            if out.get("tool_call_id"):
+                state["messages"][-1]["tool_call_id"] = out["tool_call_id"]
         else:
             tool_content = "<tool_response>\n" + json.dumps(tool_res, ensure_ascii=False) + "\n</tool_response>"
             _append_and_track(state, "user", tool_content)
@@ -641,6 +656,8 @@ def finalize_state(state):
     x["generation_tokens"] = state.get("generation_tokens", 0)
     x["prefill_tokens"] = state.get("prefill_tokens", 0)
     x["token_cost"] = x["generation_tokens"] + 0.2 * x["prefill_tokens"]
+    x["api_prompt_tokens"] = int(state.get("api_prompt_tokens", 0))
+    x["api_completion_tokens"] = int(state.get("api_completion_tokens", 0))
     x["prompt_mode"] = state.get("prompt_mode", "current")
     x["reasoning_mode"] = "reasoning" if bool(state.get("require_reasoning", True)) else "no_reasoning"
 
@@ -774,6 +791,7 @@ def evaluate_batched(tasks, model, max_rounds=8, record_mode="lite", prompt_mode
 # Data loading: local JSON or HuggingFace dataset
 # ---------------------------------------------------------------------------
 HF_DATASET_ID = "cesun/When2Tool"
+HF_DATASET_REVISION = os.environ.get("WHEN2TOOL_DATASET_REVISION", "4a6d05f")
 
 _PATH_TO_HF = {
     "tasks_v1_train.json": ("single_hop", "train"),
@@ -792,8 +810,8 @@ def _load_from_hf(config: str, split: str) -> list:
             "Local data not found. Install datasets to auto-download from HF: "
             "pip install datasets"
         )
-    print(f"Loading from HuggingFace: {HF_DATASET_ID} ({config}/{split})")
-    ds = load_dataset(HF_DATASET_ID, config, split=split)
+    print(f"Loading from HuggingFace: {HF_DATASET_ID}@{HF_DATASET_REVISION} ({config}/{split})")
+    ds = load_dataset(HF_DATASET_ID, config, split=split, revision=HF_DATASET_REVISION)
     tasks = []
     for row in ds:
         task = {

@@ -202,6 +202,20 @@ The multi-hop pipeline evaluates 3-step tool-call chains:
 ./run_multihop_pipeline.sh qwen3-4b-instruct
 ```
 
+## FTEC5660 DeepSeek Reproduction
+
+This checkout adds a DeepSeek API backend and a course-sized comparison of the default and sparse-tool policies on the complete 150-task `CalculatorEnv` test subset. It runs three repetitions and produces accuracy/tool-call metrics by difficulty. The API backend uses native function calling; its key is read from `DEEPSEEK_API_KEY` and is never stored in tracked files.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-deepseek.txt
+# If .env does not exist, copy .env.example to .env, then set DEEPSEEK_API_KEY.
+./run_course_reproduction.sh
+```
+
+See [COURSE_REPRODUCTION.md](COURSE_REPRODUCTION.md) for the target claim, model-swap caveat, metric definitions, and report/presentation outline. DeepSeek's hosted API does not expose hidden states, so this project reproduces the paper's prompt-baseline behavior rather than PROBE&PREFILL.
+
 ## Project Structure
 
 ```

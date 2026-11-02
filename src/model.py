@@ -1,13 +1,11 @@
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import random
 import re
 import string
 from copy import deepcopy
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
-
 
 def _try_json_block(s):
     # Try json.loads first (handles valid JSON)
@@ -103,6 +101,9 @@ class HFAgentBackend:
         device="cuda",
         enable_thinking=None,
     ):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.max_new_tokens = max_new_tokens
         self.enable_thinking = enable_thinking
@@ -194,6 +195,7 @@ class VLLMAgentBackend:
         dtype="bfloat16",
         enable_thinking=None,
     ):
+        from transformers import AutoTokenizer, GenerationConfig
         from vllm import LLM, SamplingParams
 
         self.SamplingParams = SamplingParams
@@ -274,6 +276,100 @@ class VLLMAgentBackend:
         return outs
 
 
+class DeepSeekAPBackend:
+    """OpenAI-compatible DeepSeek backend for tool-necessity evaluation."""
+
+    def __init__(self, model_path, temperature=0.7, top_p=None,
+                 max_new_tokens=512, base_url=None, max_workers=4):
+        from openai import OpenAI
+
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set DEEPSEEK_API_KEY in the environment before running.")
+        self.model_name = model_path
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_new_tokens = max_new_tokens
+        self.max_workers = max_workers
+        self.base_url = base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        self.client = OpenAI(api_key=api_key, base_url=self.base_url)
+        self.tokenizer = None
+
+    def render_prompt(self, messages, tools=None):
+        return json.dumps(messages, ensure_ascii=False)
+
+    def _complete_one(self, messages, tools):
+        request = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+        if self.top_p is not None:
+            request["top_p"] = self.top_p
+        if tools:
+            request["tools"] = tools
+            request["tool_choice"] = "auto"
+
+        response = self.client.chat.completions.create(**request)
+        message = response.choices[0].message
+        content = message.content or ""
+        prompt_text = self.render_prompt(messages, tools)
+
+        if message.tool_calls:
+            # The harness executes one tool at a time. Preserve one matching call
+            # in the conversation so the next API request remains well formed.
+            call = message.tool_calls[0]
+            try:
+                arguments = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            api_message = {
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": [{
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments or "{}",
+                    },
+                }],
+            }
+            return {
+                "type": "tool",
+                "tool_call_id": call.id,
+                "tool_name": call.function.name,
+                "arguments": arguments if isinstance(arguments, dict) else {},
+                "content": content,
+                "raw_text": content,
+                "api_message": api_message,
+                "prompt_text": prompt_text,
+                "finish_reason": response.choices[0].finish_reason,
+                "api_usage": {
+                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                },
+            }
+        return {
+            "type": "content",
+            "content": content,
+            "raw_text": content,
+            "prompt_text": prompt_text,
+            "finish_reason": response.choices[0].finish_reason,
+            "api_usage": {
+                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+            },
+        }
+
+    def generate_batch(self, messages_batch, tools_batch, prefills=None):
+        pairs = list(zip(messages_batch, tools_batch))
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            return list(pool.map(lambda pair: self._complete_one(*pair), pairs))
+
+
 class AgentModel:
     def __init__(
         self,
@@ -289,6 +385,8 @@ class AgentModel:
         vllm_dtype="bfloat16",
         enable_thinking=None,
         system_prompt_override=None,
+        api_base_url=None,
+        api_max_workers=4,
     ):
         from utils import get_system_prompt, detect_tool_format
         if system_prompt_override:
@@ -297,7 +395,17 @@ class AgentModel:
             fmt = detect_tool_format(model_path)
             self.system_prompt = get_system_prompt(fmt)
 
-        if backend == "hf":
+        if backend == "deepseek":
+            self.engine = DeepSeekAPBackend(
+                model_path=model_path,
+                temperature=temperature if temperature is not None else 0.7,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+                base_url=api_base_url,
+                max_workers=api_max_workers,
+            )
+            self.tokenizer = None
+        elif backend == "hf":
             self.engine = HFAgentBackend(
                 model_path=model_path,
                 temperature=temperature,
@@ -307,6 +415,8 @@ class AgentModel:
                 device=device,
                 enable_thinking=enable_thinking,
             )
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         elif backend == "vllm":
             self.engine = VLLMAgentBackend(
                 model_path=model_path,
@@ -319,10 +429,10 @@ class AgentModel:
                 dtype=vllm_dtype,
                 enable_thinking=enable_thinking,
             )
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         else:
             raise ValueError(f"Unsupported backend: {backend}")
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     def generate_batch(self, messages_batch, tools_batch, prefills=None):
         return self.engine.generate_batch(messages_batch, tools_batch, prefills=prefills)

@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 
 from model import AgentModel
 from utils import (
@@ -103,12 +104,15 @@ def build_metrics(outputs):
             "tool_calls": tool_calls,
             "expected_steps": expected_steps,
             "tool_call_rate": tool_call_rate,
+            "api_prompt_tokens": item.get("api_prompt_tokens", 0),
+            "api_completion_tokens": item.get("api_completion_tokens", 0),
         }
         per_task.append(rec)
 
         agg = by_difficulty.setdefault(
             difficulty, {"n": 0, "final_correct": 0, "tool_calls": 0, "expected_steps": 0,
-                         "generation_tokens": 0, "prefill_tokens": 0, "token_cost": 0.0},
+                         "generation_tokens": 0, "prefill_tokens": 0, "token_cost": 0.0,
+                         "api_prompt_tokens": 0, "api_completion_tokens": 0},
         )
         agg["n"] += 1
         agg["final_correct"] += int(final_correct)
@@ -117,6 +121,8 @@ def build_metrics(outputs):
         agg["generation_tokens"] += item.get("generation_tokens", 0)
         agg["prefill_tokens"] += item.get("prefill_tokens", 0)
         agg["token_cost"] += item.get("token_cost", 0.0)
+        agg["api_prompt_tokens"] = agg.get("api_prompt_tokens", 0) + item.get("api_prompt_tokens", 0)
+        agg["api_completion_tokens"] = agg.get("api_completion_tokens", 0) + item.get("api_completion_tokens", 0)
 
         total_tool_calls_all += tool_calls
         total_expected_steps_all += expected_steps
@@ -141,6 +147,8 @@ def build_metrics(outputs):
         "avg_token_cost": (total_token_cost_all / len(per_task)) if per_task else 0.0,
         "total_generation_tokens": total_gen_tokens_all,
         "total_prefill_tokens": total_prefill_tokens_all,
+        "api_prompt_tokens": sum(agg.get("api_prompt_tokens", 0) for agg in by_difficulty.values()),
+        "api_completion_tokens": sum(agg.get("api_completion_tokens", 0) for agg in by_difficulty.values()),
     }
 
     return {"overall": overall, "by_difficulty": by_difficulty, "per_task": per_task}
@@ -275,7 +283,8 @@ def _aggregate_multi_run_metrics(all_run_metrics):
 
     # Collect scalar metrics to aggregate
     result = {"n_runs": len(all_run_metrics)}
-    scalar_keys = ["final_accuracy", "avg_tool_calls", "tool_call_rate", "avg_token_cost", "total_token_cost"]
+    scalar_keys = ["final_accuracy", "avg_tool_calls", "tool_call_rate", "avg_token_cost", "total_token_cost",
+                   "api_prompt_tokens", "api_completion_tokens"]
 
     # Overall
     for key in scalar_keys:
@@ -304,8 +313,9 @@ def _run_one_mode(args, data, model, mode, output_path, require_reasoning=True, 
     all_run_settings = []
 
     for run_idx in range(n_runs):
+        random.seed(args.seed + run_idx)
         if n_runs > 1:
-            print(f"\n[{label}] Run {run_idx}/{n_runs}...")
+            print(f"\n[{label}] Run {run_idx + 1}/{n_runs} (local seed={args.seed + run_idx})...")
 
         outputs = evaluate_batched(
             data,
@@ -320,6 +330,13 @@ def _run_one_mode(args, data, model, mode, output_path, require_reasoning=True, 
         all_run_outputs[f"run_{run_idx}"] = outputs
         all_run_metrics.append(build_metrics(outputs))
         all_run_settings.append(build_setting_table(outputs))
+
+        # Keep completed runs recoverable if a later API request fails.
+        if n_runs > 1:
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            checkpoint_path = output_path + ".partial"
+            with open(checkpoint_path, "w", encoding="utf-8") as f:
+                json.dump(all_run_outputs, f, ensure_ascii=False, indent=2)
 
     out_dir = os.path.dirname(output_path) or "."
     os.makedirs(out_dir, exist_ok=True)
@@ -342,12 +359,30 @@ def _run_one_mode(args, data, model, mode, output_path, require_reasoning=True, 
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(save_outputs, f, ensure_ascii=False, indent=2)
+    partial_path = output_path + ".partial"
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
 
     # For grouped outputs and display, use the first run
     first_outputs = all_run_outputs["run_0"]
     by_env_dir, by_difficulty_dir, env_groups, difficulty_groups = dump_grouped_outputs(first_outputs, output_path)
 
     metrics_path = os.path.splitext(output_path)[0] + "_metrics.json"
+    if isinstance(save_metrics, dict):
+        save_metrics["run_configuration"] = {
+            "provider": "DeepSeek API" if args.backend == "deepseek" else args.backend,
+            "model": args.model_path,
+            "base_url": (args.api_base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
+                if args.backend == "deepseek" else None,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_new_tokens": args.max_new_tokens,
+            "prompt_mode": mode,
+            "reasoning_mode": "reasoning" if require_reasoning else "no_reasoning",
+            "run_seeds": [args.seed + i for i in range(n_runs)],
+            "hosted_api_seed_control": False if args.backend == "deepseek" else None,
+            "system_prompt": model.system_prompt,
+        }
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(save_metrics, f, ensure_ascii=False, indent=2)
 
@@ -395,7 +430,11 @@ def main():
         required=True,
         help="HF model repo path or alias (e.g. qwen2.5-7b, llama3.1-8b).",
     )
-    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "hf"])
+    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "hf", "deepseek"])
+    parser.add_argument("--api_base_url", type=str, default=None,
+                        help="DeepSeek API URL; defaults to DEEPSEEK_BASE_URL or https://api.deepseek.com")
+    parser.add_argument("--api_workers", type=int, default=4,
+                        help="Maximum concurrent DeepSeek requests.")
     parser.add_argument("--data_path", type=str, default="./data/tasks_v1_test.json",
                         help="Path to task JSON (auto-downloads from HuggingFace if not found locally)")
     parser.add_argument("--output_path", type=str, default="./outputs/gen_res.json")
@@ -411,6 +450,8 @@ def main():
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Local seed recorded per run; hosted API generation is not seed-controlled.")
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--tensor_parallel_size", type=int, default=4)
@@ -446,6 +487,7 @@ def main():
     )
 
     args = parser.parse_args()
+    random.seed(args.seed)
 
     enable_thinking = None
     if args.enable_thinking == "true":
@@ -485,6 +527,8 @@ def main():
         vllm_dtype=args.vllm_dtype,
         enable_thinking=enable_thinking,
         system_prompt_override=system_prompt,
+        api_base_url=args.api_base_url,
+        api_max_workers=args.api_workers,
     )
 
     prompt_modes = list(PROMPT_MODES) if args.prompt_mode == "all" else [args.prompt_mode]
