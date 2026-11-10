@@ -8,6 +8,10 @@
 
 The assignment permits one clearly defined benchmark slice. This experiment preserves all three difficulty levels (50 tasks each) and repeats each setting three times. Its numbers are specific to DeepSeek and CalculatorEnv; they do not reproduce the paper's Qwen/Llama table values.
 
+## Paper result comparison
+
+Table 2 in the paper reports the change from Default to Sparse for Prompt-only baselines. On hard tasks, Qwen3-4B-Instruct loses 20.3 accuracy points and makes 0.48 fewer tool calls per task; Qwen3-14B loses 27.3 points and makes 0.47 fewer calls. In this DeepSeek CalculatorEnv slice, hard-task accuracy falls by 58 points while calls fall by 0.7867 per task. The direction matches the paper. The magnitudes are not directly comparable because the model differs and this reproduction covers one environment (50 tasks per difficulty), whereas the paper evaluates the full benchmark. This supports the qualitative behavior, not the paper's numeric result. Source: Sun et al., arXiv:2605.09252v3, Table 2, 4 Nov 2026.
+
 ## Model substitution and scope limit
 
 The original paper evaluates local Qwen/Llama models and uses their hidden states. The requested model is DeepSeek's hosted API, accessed with model ID `deepseek-flash` at `https://api.deepseek.com`. DeepSeek documents this model ID as DeepSeek-V4.1-Flash-1017 as of this run. The hosted API does not expose hidden states, so PROBE&PREFILL's linear probe and AUROC cannot be evaluated here. Instead, this project reproduces a measurable prompt-baseline behavior in WHEN2TOOL. The model substitution is a controlled variable and is not the experiment's selected modification.
