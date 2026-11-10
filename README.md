@@ -1,4 +1,4 @@
-# When2Tool
+# FTEC5660 Individual Project: WHEN2TOOL
 
 2026/09/24 Update: Our paper has been accepted to NeurIPS 2026!
 
