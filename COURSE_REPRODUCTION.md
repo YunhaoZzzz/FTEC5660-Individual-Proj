@@ -61,6 +61,8 @@ Sparse prompting reduced tool calls by **88.1%** (0.7289 to 0.0867 per task) and
 
 Sparse prompting also increased mean completion tokens per run from 6,882 to 28,857, because more tasks needed extra answer attempts. Across both settings the experiment used about 867,000 prompt tokens and 107,000 completion tokens. Using the provider's listed rates and assuming every prompt token was a cache miss, the estimated total is about **US$0.20–$0.39** depending on off-peak or peak rates; cache hits lower the actual charge. This is an estimate, not a billing statement.
 
+Price source: [DeepSeek API Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing/), checked 10 November 2026.
+
 ## Selected modification and impact
 
 **Modification:** changed one prompt-policy setting from the default to the existing `sparse_tool` instruction, which tells the agent to default to zero tool calls and try solving directly.
